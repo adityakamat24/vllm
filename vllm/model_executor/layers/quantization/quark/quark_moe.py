@@ -515,9 +515,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                 w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=dtype
             )
         else:
-            raise NotImplementedError(
-                f"Unsupported ocp_mx_scheme={self.ocp_mx_scheme}"
-            )
+            raise NotImplementedError(f"Unsupported ocp_mx_scheme={self.ocp_mx_scheme}")
 
         return dequant_w1, dequant_w2
 
@@ -538,9 +536,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         elif self.input_dtype == "mxfp6_e2m3":
             return quant_dequant_mxfp6(hidden_states, quant_dtype="fp6_e2m3")
         else:
-            raise NotImplementedError(
-                f"Unsupported input_dtype={self.input_dtype}"
-            )
+            raise NotImplementedError(f"Unsupported input_dtype={self.input_dtype}")
 
     def create_weights(
         self,
