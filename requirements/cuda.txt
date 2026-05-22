@@ -12,7 +12,11 @@ torchvision==0.26.0 # Required for phi3v processor. See https://github.com/pytor
 flashinfer-python==0.6.11.post2
 flashinfer-cubin==0.6.11.post2
 apache-tvm-ffi==0.1.9
-tilelang==0.1.9
+# Range allows resolving to 0.1.8 when the optional `gdn-flashqla` extra
+# pulls in FlashQLA (which pins `tilelang==0.1.8`). Pre-flight: run
+# tests/kernels/ (tilelang/mhc) and tests/models/test_deepseek_v4_mega_moe.py
+# on tilelang==0.1.8 before submitting the PR.
+tilelang>=0.1.8,<0.2.0
 # Cap nvidia-cudnn-frontend (transitive dep of flashinfer) due to
 # breaking changes in 1.19.0
 nvidia-cudnn-frontend>=1.13.0,<1.19.0

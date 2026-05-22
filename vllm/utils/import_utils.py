@@ -435,6 +435,11 @@ def has_tilelang() -> bool:
     return _has_module("tilelang")
 
 
+def has_flash_qla() -> bool:
+    """Whether the optional `flash_qla` package is available."""
+    return _has_module("flash_qla")
+
+
 def has_arctic_inference() -> bool:
     """Whether the optional `arctic_inference` package is available."""
 

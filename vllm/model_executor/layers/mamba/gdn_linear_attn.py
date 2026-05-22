@@ -110,22 +110,59 @@ def _should_use_flashinfer_gdn_prefill(backend: str, head_k_dim: int | None) -> 
     return current_platform.get_cuda_runtime_major() >= 13
 
 
+def _should_use_flashqla_gdn_prefill(
+    backend: str, head_k_dim: int | None, head_v_dim: int | None
+) -> bool:
+    """Whether to use FlashQLA's Hopper-fused GDN prefill kernel.
+
+    Opt-in only — never auto-selected because FlashQLA's own tests
+    use a 2% tolerance vs the FLA reference (see QwenLM/FlashQLA#15).
+
+    Requirements:
+    * ``requested == "flashqla"``;
+    * ``platform == cuda`` and Hopper (SM90) — FlashQLA hard-asserts ``sm_90``;
+    * ``head_k_dim == head_v_dim == 128`` (kernel hardcodes ``K == V == 128``
+      and ``chunk_size == 64``);
+    * the optional ``flash_qla`` Python package is importable
+      (``pip install vllm[gdn-flashqla]``).
+    """
+    if backend != "flashqla":
+        return False
+    if not current_platform.is_cuda():
+        return False
+    if not current_platform.is_device_capability(90):
+        return False
+    if head_k_dim != 128 or head_v_dim != 128:
+        return False
+    from vllm.utils.import_utils import has_flash_qla
+
+    return has_flash_qla()
+
+
 def _log_gdn_backend_decision(
-    backend: str, head_k_dim: int | None, use_flashinfer: bool
+    backend: str, head_k_dim: int | None, chosen: str
 ) -> None:
-    """Log the GDN prefill backend choice in the attention-selector style."""
-    chosen = "FlashInfer" if use_flashinfer else "Triton/FLA"
+    """Log the GDN prefill backend choice in the attention-selector style.
+
+    ``chosen`` is the human-readable backend label
+    (``"FlashQLA"`` / ``"FlashInfer"`` / ``"Triton/FLA"``).
+    """
     logger.info_once(
         "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s).",
         chosen,
         backend,
         head_k_dim,
     )
-    # JIT-compiled cutlass path is only used on SM90 (Hopper).
-    if use_flashinfer and current_platform.is_device_capability(90):
+    if chosen == "FlashInfer" and current_platform.is_device_capability(90):
         logger.warning_once(
             "FlashInfer GDN prefill is JIT-compiled; first run may take a "
             "while. Set --gdn-prefill-backend triton to skip JIT.",
+        )
+    elif chosen == "FlashQLA":
+        logger.warning_once(
+            "FlashQLA GDN prefill is JIT-compiled via TileLang; first run may "
+            "take a while. See QwenLM/FlashQLA#15 for known numerical-drift "
+            "caveats vs the FLA/Triton reference.",
         )
 
 
@@ -178,27 +215,100 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+def fqla_chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+):
+    """Wrap FlashQLA's chunked GDN prefill kernel for vLLM.
+
+    FlashQLA accepts the same ``(q, k, v, g, beta)`` 4-D layout as FLA
+    (``[B, T, H, D]``) and the same raw log-space ``g``, so no exp/squeeze
+    plumbing is required. The two differences vs FLA:
+
+    1. State layout: FlashQLA's kernel asserts ``[N, H, K, V]`` while vLLM/FLA
+       use ``[N, H, V, K]``. Transpose at the boundary on both directions.
+       For Qwen3-Next this is a no-op in element count (K==V==128) but is
+       still required for correct element order.
+    2. Sentinels: ``chunk_indices`` / ``chunk_offsets`` are not exposed —
+       FlashQLA recomputes them internally (cached by tensor identity).
+    """
+    from flash_qla import chunk_gated_delta_rule as flashqla_chunk_gated_delta_rule
+
+    h0 = (
+        initial_state.transpose(-2, -1).contiguous()
+        if initial_state is not None
+        else None
+    )
+
+    o, final_state = flashqla_chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=None,  # FlashQLA default is K**-0.5 — matches FLA's default.
+        initial_state=h0,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        cu_seqlens=cu_seqlens,
+        head_first=False,
+    )
+    if output_final_state and final_state is not None:
+        final_state = final_state.transpose(-2, -1).contiguous()
+    return o, final_state
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
-    def __init__(self, head_k_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        head_k_dim: int | None = None,
+        head_v_dim: int | None = None,
+    ) -> None:
         super().__init__()
         additional_config = get_current_vllm_config().additional_config
         assert isinstance(additional_config, dict)
         backend_cfg = additional_config.get("gdn_prefill_backend", "auto")
         backend = str(backend_cfg).strip().lower()
 
-        use_flashinfer = _should_use_flashinfer_gdn_prefill(backend, head_k_dim)
+        use_flashqla = _should_use_flashqla_gdn_prefill(
+            backend, head_k_dim, head_v_dim
+        )
+        if backend == "flashqla" and not use_flashqla:
+            logger.warning_once(
+                "GDN prefill backend 'flashqla' is selected but cannot run on "
+                "the current platform (requires CUDA SM90, "
+                "head_k_dim=head_v_dim=128, and the `flash_qla` package). "
+                "Falling back to FlashInfer/Triton."
+            )
+
+        use_flashinfer = (not use_flashqla) and _should_use_flashinfer_gdn_prefill(
+            backend, head_k_dim
+        )
         if backend == "flashinfer" and not use_flashinfer:
             logger.warning_once(
                 "GDN prefill backend 'flashinfer' is selected but "
                 "cannot use this kernel on the current platform. "
                 "Falling back to Triton/FLA."
             )
-        _log_gdn_backend_decision(backend, head_k_dim, use_flashinfer)
 
-        self._forward_method = (
-            self.forward_cuda if use_flashinfer else self.forward_native
-        )
+        if use_flashqla:
+            chosen = "FlashQLA"
+            self._forward_method = self.forward_flashqla
+        elif use_flashinfer:
+            chosen = "FlashInfer"
+            self._forward_method = self.forward_cuda
+        else:
+            chosen = "Triton/FLA"
+            self._forward_method = self.forward_native
+        _log_gdn_backend_decision(backend, head_k_dim, chosen)
 
     def forward_cuda(
         self,
@@ -261,6 +371,40 @@ class ChunkGatedDeltaRule(CustomOp):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             core_attn_out=core_attn_out,
         )
+
+    def forward_flashqla(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        # chunk_indices / chunk_offsets are intentionally unused: FlashQLA
+        # recomputes them internally (cached by tensor identity).
+        o, final_state = fqla_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if core_attn_out is not None:
+            o_flat = o.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        return o, final_state
 
 
 @PluggableLayer.register("gated_delta_net_attention")
@@ -425,7 +569,10 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             prefix=f"{prefix}.out_proj",
         )
 
-        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(head_k_dim=self.head_k_dim)
+        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+        )
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE

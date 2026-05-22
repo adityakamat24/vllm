@@ -711,7 +711,7 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
+    gdn_prefill_backend: Literal["flashinfer", "triton", "flashqla"] | None = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1517,9 +1517,13 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton"],
+            choices=["flashinfer", "triton", "flashqla"],
             default=None,
-            help="Select GDN prefill backend.",
+            help=(
+                "Select GDN prefill backend. 'flashqla' is opt-in only and "
+                "requires SM90 (Hopper), head_k_dim=head_v_dim=128, and the "
+                "`flash_qla` package (install via `pip install vllm[gdn-flashqla]`)."
+            ),
         )
         return parser
 

@@ -1186,6 +1186,13 @@ setup(
         #   - .buildkite/test_areas/kernels.yaml
         #   - .buildkite/test-amd.yaml
         "helion": ["helion==1.0.0"],
+        # Optional FlashQLA Hopper-fused GDN prefill kernels (SM90 only).
+        # Used by --gdn-prefill-backend=flashqla for Qwen3-Next/Qwen3.5 linear
+        # attention. FlashQLA has no PyPI release; pin a specific commit for
+        # reproducibility. Refresh the SHA when bumping.
+        "gdn-flashqla": [
+            "flash-qla @ git+https://github.com/QwenLM/FlashQLA.git@6ef4858b5446e05bd461d9658d877e548182dbcb",
+        ],
         # Optional deps for gRPC server (vllm serve --grpc)
         "grpc": ["smg-grpc-servicer[vllm] >= 0.5.2"],
         # Optional deps for OpenTelemetry tracing
